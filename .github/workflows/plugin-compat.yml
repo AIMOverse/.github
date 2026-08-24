@@ -319,7 +319,9 @@ jobs:
       # which is why the callers that use this mode also have the agent stamp
       # a processed marker: it makes "we looked and nothing was needed" a
       # recorded fact rather than a silence.
-      - uses: peter-evans/create-pull-request@v7
+      # Pinned for the same reason as the agent action above: it is handed a
+      # write token, and a moving tag is a standing invitation.
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
         if: inputs.pull_request == ''
         with:
           token: ${{ secrets.agent_token }}
