@@ -27,7 +27,19 @@ jobs:
   enable:
     name: enable auto-merge
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
+    # Same-repository pull requests only. A branch in this repository can only
+    # be created by somebody with push access, so this is the trust boundary
+    # already drawn by the repository's own permissions — no second list to
+    # keep in step with it.
+    #
+    # Without it, `pull_request_target` fires for forks too, and on a public
+    # repository that would mean anyone at all could land code on `main` by
+    # writing a change that passes `npm test`. Auto-merge is meant to spare
+    # the people who already have commit rights from clicking a button, not
+    # to hand those rights to everybody.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: write
       pull-requests: write
