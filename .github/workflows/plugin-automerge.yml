@@ -1,0 +1,76 @@
+name: Plugin auto-merge
+
+# The merge half of the maintenance rule for the BitRouter harness plugins:
+# a pull request that passes its checks merges itself, and the only step a
+# person performs is cutting a release.
+#
+# That is only safe because of what sits on either side of it. Underneath,
+# branch protection with required checks — without those, "auto-merge" means
+# "merge on open, unreviewed", because GitHub merges as soon as nothing is
+# outstanding and nothing being required means nothing is outstanding. Above,
+# a publish workflow that fires on a release and never on a push to main, so
+# `main` moving on its own reaches nobody until a person tags it.
+#
+# This workflow only ever *enables* auto-merge. GitHub does the merging, when
+# and only when the required checks pass. Nothing here can merge a red pull
+# request, and nothing here bypasses protection.
+
+on:
+  workflow_call:
+    inputs:
+      merge_method:
+        required: false
+        type: string
+        default: squash
+
+jobs:
+  enable:
+    name: enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          IS_BOT: ${{ github.event.pull_request.user.type == 'Bot' }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          METHOD: ${{ inputs.merge_method }}
+        run: |
+          set -euo pipefail
+
+          # An explicit stop, whoever applied it — the agent that was unsure of
+          # its own fix, or a human who wants to look. Removing the label and
+          # re-running is what turns it back on.
+          case ",${LABELS}," in
+            *,needs-human,*)
+              echo "labelled needs-human — disabling auto-merge on #$PR"
+              gh pr merge "$PR" --repo "$REPO" --disable-auto || true
+              exit 0 ;;
+          esac
+
+          # The one case where "the tests pass" is circular reasoning. An agent
+          # asked to repair a break can always make a suite green by weakening
+          # the suite, so for an automated pull request that edits code and its
+          # tests in the same change, green is not evidence and a person looks.
+          # A human pull request doing the same thing is ordinary work.
+          if [ "$IS_BOT" = "true" ]; then
+            FILES=$(gh pr diff "$PR" --repo "$REPO" --name-only)
+            SRC=$(printf '%s\n' "$FILES" | grep -c '^src/' || true)
+            TST=$(printf '%s\n' "$FILES" | grep -c '^test/' || true)
+            if [ "$SRC" -gt 0 ] && [ "$TST" -gt 0 ]; then
+              echo "automated pull request touches both src/ and test/ — handing it to a human"
+              gh pr edit "$PR" --repo "$REPO" --add-label needs-human
+              gh pr comment "$PR" --repo "$REPO" --body \
+                "Auto-merge withheld: this is an automated change that edits both \`src/\` and \`test/\`. Passing tests do not independently confirm a change that could have altered the tests, so this one wants human eyes. Remove the \`needs-human\` label to release it."
+              exit 0
+            fi
+          fi
+
+          echo "enabling auto-merge on #$PR (author: $AUTHOR)"
+          gh pr merge "$PR" --repo "$REPO" --auto --"$METHOD"
