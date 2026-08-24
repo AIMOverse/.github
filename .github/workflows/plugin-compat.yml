@@ -1,0 +1,353 @@
+name: Plugin compatibility
+
+# The one copy of the compatibility policy for the BitRouter harness plugins
+# (bitrouter-dsh, bitrouter-pi, bitrouter-opencode).
+#
+# The plugins are three separate repositories with three different harnesses,
+# so almost everything about them is per-repo — install commands, test
+# commands, what a "model" even is on the other side of the mapping. What is
+# NOT per-repo is the judgement: what an agent is allowed to change, when it
+# should decline, and what it must never do. That is policy, and three drifting
+# copies of a policy is three different behaviours. So it lives here, once, and
+# the plugin repositories call it with their own particulars.
+#
+# Two modes, chosen by whether `pull_request` is set:
+#
+#   - unset — the agent works on a fresh branch and a pull request is opened
+#     from whatever it changed. Used when BitRouter itself releases.
+#   - set   — the agent works on an existing pull request's branch and pushes
+#     to it. Used to repair a Dependabot harness bump whose CI went red, so
+#     the bump and its fix travel together and merge as one thing.
+#
+# The agent never opens the pull request itself and never runs git. It edits
+# files and writes a report; this workflow does everything with consequences.
+# That keeps the deterministic parts deterministic — branch names, titles,
+# which paths may be committed — and leaves the model only the part that
+# actually needs judgement.
+
+on:
+  workflow_call:
+    inputs:
+      reason:
+        description: "One sentence: why this run exists. Goes to the agent and into the pull request."
+        required: true
+        type: string
+      brief:
+        description: "Trigger-specific instructions for the agent, appended to the standing policy below."
+        required: true
+        type: string
+      install:
+        description: "Command that installs dependencies, e.g. `npm ci`."
+        required: true
+        type: string
+      build:
+        description: "Command that builds or typechecks."
+        required: true
+        type: string
+      test:
+        description: "Command that runs the suite."
+        required: true
+        type: string
+      branch:
+        description: >-
+          Branch to open the pull request from. Ignored when `pull_request` is
+          set. Must stay under one of the prefixes plugin-automerge.yml
+          recognises as automation, or the pull request this opens will wait
+          for a human who is not expecting it.
+        required: false
+        type: string
+        default: chore/upstream-compat
+      title:
+        description: "Pull request title. Ignored when `pull_request` is set."
+        required: false
+        type: string
+        default: "chore: upstream compatibility"
+      pull_request:
+        description: "Existing pull request number to work on and push to. Empty for the fresh-branch mode."
+        required: false
+        type: string
+        default: ""
+      node_version:
+        required: false
+        type: string
+        default: "20"
+      model:
+        description: "opencode model reference. Defaults to routing through BitRouter."
+        required: false
+        type: string
+        default: bitrouter/bitrouter/auto
+    secrets:
+      agent_token:
+        description: >-
+          Token the agent's commits and pull requests are made with. Must NOT be
+          the default GITHUB_TOKEN: a pull request opened with that token does
+          not trigger workflows, so it would arrive with no checks and could
+          never satisfy a required one. Needs contents:write and
+          pull-requests:write on the calling repository.
+        required: true
+      bitrouter_api_key:
+        required: true
+
+jobs:
+  compat:
+    name: upstream compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # For the repair mode, the branch under a pull request. Checked out by
+      # SHA rather than by name: the ref could move between the trigger firing
+      # and this step running, and a token with write access should not be
+      # handed to whatever arrived in the meantime.
+      - name: resolve the ref to work on
+        id: ref
+        env:
+          GH_TOKEN: ${{ secrets.agent_token }}
+          PR: ${{ inputs.pull_request }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PR" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "head=" >> "$GITHUB_OUTPUT"
+            echo "fresh-branch mode"
+            exit 0
+          fi
+          gh pr view "$PR" --repo "$REPO" --json headRefName,headRefOid,author \
+            --jq '"sha=\(.headRefOid)\nhead=\(.headRefName)\nauthor=\(.author.login)"' >> "$GITHUB_OUTPUT"
+          echo "repair mode on #$PR"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.ref.outputs.sha }}
+          token: ${{ secrets.agent_token }}
+          # Needed in repair mode to push back, and harmless otherwise: the
+          # fresh-branch mode commits through the same token below.
+          persist-credentials: true
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      # Written to opencode's global config rather than into the checkout, so
+      # it can never turn up in the agent's diff. This is the same provider
+      # declaration as `examples/opencode.json` in bitrouter-opencode — the
+      # manual form, because `@bitrouter/opencode` is not published yet. When
+      # it is, this becomes an install of the plugin and the maintenance
+      # automation dogfoods the plugin it maintains.
+      - name: point opencode at BitRouter
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.config/opencode"
+          cat > "$HOME/.config/opencode/opencode.json" <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "bitrouter": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "BitRouter",
+                "options": {
+                  "baseURL": "https://api.bitrouter.ai/v1",
+                  "apiKey": "{env:BITROUTER_API_KEY}"
+                },
+                "models": {
+                  "bitrouter/auto": {
+                    "name": "BitRouter Auto",
+                    "limit": { "context": 128000, "output": 16384 }
+                  }
+                }
+              }
+            }
+          }
+          JSON
+          echo "configured for $MODEL"
+
+      # Pinned to the commit behind v1.18.21 rather than a moving tag, because
+      # this step holds a write token and an API key.
+      #
+      # Worth knowing what that does and does not buy: the action's own steps
+      # are pinned, but its install step fetches opencode's latest release at
+      # run time, so the *tool* is not pinned by this and cannot be from here.
+      - name: run the compatibility agent
+        uses: anomalyco/opencode/github@826d9ad46a22bef0294998e08daa3c4904fea28f
+        env:
+          BITROUTER_API_KEY: ${{ secrets.bitrouter_api_key }}
+          GITHUB_TOKEN: ${{ secrets.agent_token }}
+          # The prompt tells the agent to write its report here.
+          REPORT_PATH: ${{ runner.temp }}/compat-report.md
+        with:
+          model: ${{ inputs.model }}
+          use_github_token: "true"
+          share: "false"
+          prompt: |
+            You are checking whether this plugin is still compatible with an
+            upstream that moved. ${{ inputs.reason }}
+
+            ## What you may do
+
+            Edit source and tests in this checkout. Nothing else. Specifically:
+
+            - Do NOT run git. No commit, no branch, no push, no tag. The
+              workflow that invoked you handles all of that, and anything you
+              do to the working tree it does not expect will be discarded or
+              will land in the wrong place.
+            - Do NOT open, edit, comment on, merge, or close a pull request or
+              an issue.
+            - Do NOT edit anything under .github/ except .github/upstream.json
+              when the brief below tells you to.
+            - Do NOT touch package versions or lockfiles unless the brief says
+              to. A dependency bump is Dependabot's job and it will conflict
+              with yours.
+
+            ## How to decide
+
+            Make the smallest change that restores compatibility, and no
+            speculative ones. "This could be nicer" is not a reason to touch a
+            line. If nothing needs to change, change nothing — an empty diff is
+            a perfectly good answer and this workflow handles it.
+
+            Where a fix needs a judgement you are not confident in — an
+            ambiguous breaking change, a behavioural choice with more than one
+            defensible answer, a change that would alter what the plugin
+            advertises to its harness — do NOT guess. Leave the code alone,
+            and say so in your report. A human reading a clear description of
+            the problem is worth more than a plausible wrong patch, and this
+            workflow will label the pull request for review when you say you
+            were unsure.
+
+            Never make a test pass by weakening it. If a test now fails because
+            the upstream genuinely changed what is correct, change the test and
+            say plainly in your report which assertion you changed and why. If
+            it fails because the plugin is now wrong, fix the plugin.
+
+            ## Verify
+
+            Run these, in this order, from the repository root:
+
+                ${{ inputs.install }}
+                ${{ inputs.build }}
+                ${{ inputs.test }}
+
+            Fix only failures your own changes caused. A test that was already
+            failing before you touched anything is not yours to fix, and
+            silencing it would hide the thing this run exists to surface — say
+            so in the report instead.
+
+            ## This run
+
+            ${{ inputs.brief }}
+
+            ## Report
+
+            Write a short markdown report to the file named by the environment
+            variable REPORT_PATH. It becomes the body of a pull request, so
+            write it for the person who has to review the diff. Cover: what
+            upstream changed, what you changed and why, what you deliberately
+            did not change, and anything you were unsure about. If you were
+            unsure about anything at all, put the literal line
+
+                NEEDS-HUMAN: <one sentence saying what needs deciding>
+
+            on its own line. Be accurate rather than reassuring; a report that
+            overstates your confidence is worse than no report.
+
+      - name: collect the outcome
+        id: outcome
+        env:
+          REPORT_PATH: ${{ runner.temp }}/compat-report.md
+        run: |
+          set -euo pipefail
+
+          # No report is itself a finding: the agent either failed or ignored
+          # its instructions, and either way nobody should merge its diff
+          # without looking.
+          if [ -s "$REPORT_PATH" ]; then
+            if grep -q '^NEEDS-HUMAN:' "$REPORT_PATH"; then NEEDS=true; else NEEDS=false; fi
+            {
+              echo "report<<COMPAT_REPORT_EOF"
+              cat "$REPORT_PATH"
+              echo "COMPAT_REPORT_EOF"
+              echo "needs_human=$NEEDS"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "report=The agent wrote no report, which it was asked to do. Read the diff with that in mind."
+              echo "needs_human=true"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+          STATUS=$(git status --porcelain)
+          if [ -n "$STATUS" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git status --short
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "the agent changed nothing"
+          fi
+
+      # Repair mode: the fix belongs on the pull request that is already
+      # failing, so the bump and the fix merge as one thing rather than as two
+      # changes that are each incomplete.
+      - name: push the fix onto the pull request
+        if: inputs.pull_request != '' && steps.outcome.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.agent_token }}
+          HEAD: ${{ steps.ref.outputs.head }}
+          PR: ${{ inputs.pull_request }}
+          REPORT: ${{ steps.outcome.outputs.report }}
+          NEEDS_HUMAN: ${{ steps.outcome.outputs.needs_human }}
+        run: |
+          set -euo pipefail
+          git config user.name "bitrouter-bot"
+          git config user.email "bot@bitrouter.ai"
+          git add -A
+          git commit -m "fix: restore compatibility with the bumped upstream" \
+                     -m "$REPORT"
+          git push origin "HEAD:$HEAD"
+          gh pr comment "$PR" --body "$REPORT"
+          if [ "$NEEDS_HUMAN" = "true" ]; then
+            gh pr edit "$PR" --add-label needs-human
+          fi
+
+      - name: say so when a failing pull request could not be repaired
+        if: inputs.pull_request != '' && steps.outcome.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.agent_token }}
+          PR: ${{ inputs.pull_request }}
+          REPORT: ${{ steps.outcome.outputs.report }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR" --body "$REPORT"
+          gh pr edit "$PR" --add-label needs-human
+
+      # Fresh-branch mode. `create-pull-request` is a no-op on an empty diff,
+      # which is why the callers that use this mode also have the agent stamp
+      # a processed marker: it makes "we looked and nothing was needed" a
+      # recorded fact rather than a silence.
+      # Pinned for the same reason as the agent action above: it is handed a
+      # write token, and a moving tag is a standing invitation.
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        if: inputs.pull_request == ''
+        with:
+          token: ${{ secrets.agent_token }}
+          branch: ${{ inputs.branch }}
+          title: ${{ inputs.title }}
+          commit-message: ${{ inputs.title }}
+          labels: ${{ steps.outcome.outputs.needs_human == 'true' && 'upstream,needs-human' || 'upstream' }}
+          body: |
+            ${{ inputs.reason }}
+
+            ---
+
+            ${{ steps.outcome.outputs.report }}
+
+            ---
+
+            <sub>Opened by `bitrouter/.github` → `plugin-compat.yml`. The diff
+            is the agent's; the branch, title, and labels are the workflow's.
+            Read the diff, not the summary above it.</sub>
