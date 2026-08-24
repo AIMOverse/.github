@@ -1,8 +1,8 @@
 name: Plugin auto-merge
 
 # The merge half of the maintenance rule for the BitRouter harness plugins:
-# a pull request that passes its checks merges itself, and the only step a
-# person performs is cutting a release.
+# an automated pull request that passes its checks merges itself, and
+# everything else is merged by a person.
 #
 # That is only safe because of what sits on either side of it. Underneath,
 # branch protection with required checks — without those, "auto-merge" means
@@ -22,6 +22,17 @@ on:
         required: false
         type: string
         default: squash
+      automation_branches:
+        description: >-
+          Newline-separated branch prefixes that identify an automated pull
+          request. Anything else is a person's and is merged by hand.
+        required: false
+        type: string
+        default: |
+          dependabot/
+          chore/bitrouter-
+          chore/upstream-
+          chore/contract-refresh
 
 jobs:
   enable:
@@ -34,9 +45,7 @@ jobs:
     #
     # Without it, `pull_request_target` fires for forks too, and on a public
     # repository that would mean anyone at all could land code on `main` by
-    # writing a change that passes `npm test`. Auto-merge is meant to spare
-    # the people who already have commit rights from clicking a button, not
-    # to hand those rights to everybody.
+    # writing a change that passes `npm test`.
     if: >-
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
@@ -49,12 +58,40 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
-          IS_BOT: ${{ github.event.pull_request.user.type == 'Bot' }}
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           METHOD: ${{ inputs.merge_method }}
+          PREFIXES: ${{ inputs.automation_branches }}
         run: |
           set -euo pipefail
+
+          # Automation is identified by its branch, not by its account.
+          #
+          # The account would be the obvious thing and it does not work here.
+          # Only Dependabot is a real Bot; the compatibility agent and the
+          # contract refresh open their pull requests with a personal access
+          # token, so GitHub reports a human author for both — and if that
+          # human is a maintainer, an account check would auto-merge their
+          # ordinary work too. Exactly backwards.
+          #
+          # The branch name is set by the workflow that created the pull
+          # request, never by whoever wrote the code in it, and a branch under
+          # any of these prefixes can only exist because one of those
+          # workflows made it. That is the property being relied on.
+          MATCHED=""
+          while IFS= read -r prefix; do
+            [ -n "$prefix" ] || continue
+            case "$HEAD" in
+              "$prefix"*) MATCHED="$prefix"; break ;;
+            esac
+          done <<< "$PREFIXES"
+
+          if [ -z "$MATCHED" ]; then
+            echo "#$PR is on '$HEAD', which is nobody's automation — $AUTHOR merges this one."
+            exit 0
+          fi
+          echo "#$PR is on '$HEAD' (matched '$MATCHED') — an automated change."
 
           # An explicit stop, whoever applied it — the agent that was unsure of
           # its own fix, or a human who wants to look. Removing the label and
@@ -70,19 +107,16 @@ jobs:
           # asked to repair a break can always make a suite green by weakening
           # the suite, so for an automated pull request that edits code and its
           # tests in the same change, green is not evidence and a person looks.
-          # A human pull request doing the same thing is ordinary work.
-          if [ "$IS_BOT" = "true" ]; then
-            FILES=$(gh pr diff "$PR" --repo "$REPO" --name-only)
-            SRC=$(printf '%s\n' "$FILES" | grep -c '^src/' || true)
-            TST=$(printf '%s\n' "$FILES" | grep -c '^test/' || true)
-            if [ "$SRC" -gt 0 ] && [ "$TST" -gt 0 ]; then
-              echo "automated pull request touches both src/ and test/ — handing it to a human"
-              gh pr edit "$PR" --repo "$REPO" --add-label needs-human
-              gh pr comment "$PR" --repo "$REPO" --body \
-                "Auto-merge withheld: this is an automated change that edits both \`src/\` and \`test/\`. Passing tests do not independently confirm a change that could have altered the tests, so this one wants human eyes. Remove the \`needs-human\` label to release it."
-              exit 0
-            fi
+          FILES=$(gh pr diff "$PR" --repo "$REPO" --name-only)
+          SRC=$(printf '%s\n' "$FILES" | grep -c '^src/' || true)
+          TST=$(printf '%s\n' "$FILES" | grep -c '^test/' || true)
+          if [ "$SRC" -gt 0 ] && [ "$TST" -gt 0 ]; then
+            echo "automated pull request touches both src/ and test/ — handing it to a human"
+            gh pr edit "$PR" --repo "$REPO" --add-label needs-human
+            gh pr comment "$PR" --repo "$REPO" --body \
+              "Auto-merge withheld: this is an automated change that edits both \`src/\` and \`test/\`. Passing tests do not independently confirm a change that could have altered the tests, so this one wants human eyes. Remove the \`needs-human\` label to release it."
+            exit 0
           fi
 
-          echo "enabling auto-merge on #$PR (author: $AUTHOR)"
+          echo "enabling auto-merge on #$PR"
           gh pr merge "$PR" --repo "$REPO" --auto --"$METHOD"

@@ -14,6 +14,32 @@ behaviours rather than three identical ones.
 | `plugin-compat.yml` | what an agent may change when an upstream moves, when it must decline, and what it must never touch |
 | `plugin-automerge.yml` | which pull requests are allowed to merge themselves |
 
+## How an automated pull request is recognised
+
+By its **branch**, not by its account.
+
+The account is the obvious thing and it does not work. Only Dependabot is a
+real `Bot`; the compatibility agent and the contract refresh open their pull
+requests with a personal access token, so GitHub reports a human author for
+both — and if that human is a maintainer, an account check would auto-merge
+their ordinary work too. Exactly backwards.
+
+A branch name is set by the workflow that created the pull request, never by
+whoever wrote the code in it, and a branch under one of these prefixes can only
+exist because one of those workflows made it:
+
+```
+dependabot/            Dependabot's own, and not configurable
+chore/bitrouter-       on-bitrouter-release.yml, per gateway tag
+chore/upstream-        plugin-compat.yml's default
+chore/contract-refresh contract.yml
+```
+
+Anything else is a person's, and a person merges it. If a caller overrides
+`branch` in `plugin-compat.yml`, it has to stay under one of these prefixes or
+the pull request it opens will sit waiting for a human who is not expecting
+it.
+
 Both are `workflow_call` only. The callers live in each plugin repository and
 pass that repository's particulars — install and test commands, which upstream
 moved, which pull request to repair.

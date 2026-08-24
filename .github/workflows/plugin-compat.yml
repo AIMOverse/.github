@@ -49,7 +49,11 @@ on:
         required: true
         type: string
       branch:
-        description: "Branch to open the pull request from. Ignored when `pull_request` is set."
+        description: >-
+          Branch to open the pull request from. Ignored when `pull_request` is
+          set. Must stay under one of the prefixes plugin-automerge.yml
+          recognises as automation, or the pull request this opens will wait
+          for a human who is not expecting it.
         required: false
         type: string
         default: chore/upstream-compat
@@ -258,21 +262,27 @@ jobs:
           REPORT_PATH: ${{ runner.temp }}/compat-report.md
         run: |
           set -euo pipefail
+
+          # No report is itself a finding: the agent either failed or ignored
+          # its instructions, and either way nobody should merge its diff
+          # without looking.
           if [ -s "$REPORT_PATH" ]; then
-            echo "report<<EOF" >> "$GITHUB_OUTPUT"
-            cat "$REPORT_PATH" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
-            if grep -q '^NEEDS-HUMAN:' "$REPORT_PATH"; then
-              echo "needs_human=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "needs_human=false" >> "$GITHUB_OUTPUT"
-            fi
+            if grep -q '^NEEDS-HUMAN:' "$REPORT_PATH"; then NEEDS=true; else NEEDS=false; fi
+            {
+              echo "report<<COMPAT_REPORT_EOF"
+              cat "$REPORT_PATH"
+              echo "COMPAT_REPORT_EOF"
+              echo "needs_human=$NEEDS"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "report=The agent wrote no report." >> "$GITHUB_OUTPUT"
-            echo "needs_human=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "report=The agent wrote no report, which it was asked to do. Read the diff with that in mind."
+              echo "needs_human=true"
+            } >> "$GITHUB_OUTPUT"
           fi
 
-          if [ -n "$(git status --porcelain)" ]; then
+          STATUS=$(git status --porcelain)
+          if [ -n "$STATUS" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             git status --short
           else
